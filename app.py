@@ -7,6 +7,7 @@ import os
 import shutil
 from typing import List, Optional
 
+import requests
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
@@ -16,7 +17,7 @@ from selenium.webdriver.chrome.service import Service as ChromeService
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
-# try optional helper
+# ----- Optional chromedriver autoinstaller support (if installed) -----
 _try_chromedriver_autoinstaller = True
 try:
     import chromedriver_autoinstaller
@@ -26,10 +27,10 @@ except Exception:
 
 # ----- Configurable defaults -----
 DEFAULT_WAIT_TIME = 25
-DEFAULT_SCROLL_PAUSE = 1.0
-DEFAULT_MAX_SCROLL_LOOPS = 60
-DEFAULT_JS_POLL_INTERVAL = 1.0
 DEFAULT_JS_POLL_TIMEOUT = 45
+DEFAULT_JS_POLL_INTERVAL = 1.0
+DEFAULT_MAX_SCROLL_LOOPS = 60
+DEFAULT_SCROLL_PAUSE = 1.0
 # ---------------------------------
 
 app = FastAPI(title="AffordableHousing Boost API", version="1.0")
@@ -52,8 +53,7 @@ class BoostResponse(BaseModel):
     screenshot_base64: Optional[str] = None
 
 
-# ---------- utilities for locating chrome & chromedriver ----------
-
+# ---------- helper: locate chrome & chromedriver ----------
 COMMON_CHROME_PATHS = [
     "/usr/bin/chromium",
     "/usr/bin/chromium-browser",
@@ -72,62 +72,42 @@ COMMON_CHROMEDRIVER_PATHS = [
 
 
 def find_chrome_binary() -> Optional[str]:
-    """Return path to a chrome/chromium binary or None."""
-    # 1) environment override
     env = os.environ.get("CHROME_BIN") or os.environ.get("GOOGLE_CHROME_SHIM")
     if env and os.path.isfile(env):
         return env
-
-    # 2) which lookups
     for exe in ("chromium", "chromium-browser", "google-chrome", "google-chrome-stable", "chrome"):
         p = shutil.which(exe)
         if p:
             return p
-
-    # 3) common static paths
     for p in COMMON_CHROME_PATHS:
         if os.path.isfile(p):
             return p
-
     return None
 
 
 def find_chromedriver_binary() -> Optional[str]:
-    """Return path to chromedriver if present, otherwise try to auto-install."""
-    # 1) environment override
     env = os.environ.get("CHROMEDRIVER_PATH") or os.environ.get("CHROMEDRIVER_BIN")
     if env and os.path.isfile(env):
         return env
-
-    # 2) which lookups
     p = shutil.which("chromedriver")
     if p:
         return p
-
-    # 3) common static paths
     for pth in COMMON_CHROMEDRIVER_PATHS:
         if os.path.isfile(pth):
             return pth
-
-    # 4) try chromedriver_autoinstaller if available and chrome binary exists
     if _try_chromedriver_autoinstaller and chromedriver_autoinstaller is not None:
         chrome_bin = find_chrome_binary()
         if chrome_bin:
             try:
-                # install returns path to the chromedriver file
                 installed = chromedriver_autoinstaller.install(path="/tmp")
                 if installed and os.path.isfile(installed):
                     return installed
             except Exception:
-                # ignore and fallback to None
                 pass
-
-    # nothing found
     return None
 
 
-# ---------- helper functions used inside worker ----------
-
+# ---------- small DOM helpers ----------
 def get_element_text_via_js(drv, el):
     try:
         txt = drv.execute_script(
@@ -139,35 +119,24 @@ def get_element_text_via_js(drv, el):
 
 
 def find_address_for_button(drv, btn):
-    """Best-effort: try listing--card ancestor, fallback to preceding address."""
     try:
-        # 1) listing--card ancestor
-        try:
-            anc = btn.find_element(By.XPATH, "./ancestor::div[contains(@class,'listing--card')][1]")
-            addr_el = anc.find_element(By.CSS_SELECTOR, "div.listing--property--address span, div.listing--property--address")
-            addr = get_element_text_via_js(drv, addr_el)
-            if addr:
-                return addr
-        except Exception:
-            pass
-
-        # 2) other ancestors
         for xp in [
+            "./ancestor::div[contains(@class,'listing--card')][1]",
             "./ancestor::div[contains(@class,'listing--item')][1]",
             "./ancestor::div[contains(@class,'listing--property--wrapper')][1]",
         ]:
             try:
                 anc = btn.find_element(By.XPATH, xp)
-                addr_el = anc.find_element(By.CSS_SELECTOR, "div.listing--property--address span, div.listing--property--address")
+                addr_el = anc.find_element(By.CSS_SELECTOR,
+                                           "div.listing--property--address span, div.listing--property--address")
                 addr = get_element_text_via_js(drv, addr_el)
                 if addr:
                     return addr
             except Exception:
-                pass
-
-        # 3) preceding address in DOM
+                continue
         try:
-            addr_el = btn.find_element(By.XPATH, "preceding::div[contains(@class,'listing--property--address')][1]//span")
+            addr_el = btn.find_element(By.XPATH,
+                                       "preceding::div[contains(@class,'listing--property--address')][1]//span")
             addr = get_element_text_via_js(drv, addr_el)
             if addr:
                 return addr
@@ -178,7 +147,7 @@ def find_address_for_button(drv, btn):
     return None
 
 
-# ---------- Selenium worker that performs the full flow ----------
+# ---------- selenium worker ----------
 def selenium_boost_worker(email: str, password: str, num_buttons: int, headless: bool,
                           wait_time: int = DEFAULT_WAIT_TIME) -> BoostResponse:
     logs: List[str] = []
@@ -188,7 +157,20 @@ def selenium_boost_worker(email: str, password: str, num_buttons: int, headless:
     try:
         logs.append("Starting Selenium worker")
 
-        # Detect chrome & chromedriver
+        # quick network pre-check (faster feedback than launching full browser)
+        test_url = "https://www.affordablehousing.com/"
+        logs.append(f"Connectivity quick-check to {test_url}")
+        try:
+            # small timeout so this returns fast if blocked
+            r = requests.head(test_url, timeout=6, allow_redirects=True)
+            logs.append(f"HEAD status_code={r.status_code}")
+        except Exception as e:
+            logs.append(f"Pre-check failed: {e}")
+            raise Exception(
+                f"Network pre-check failed for {test_url}. Either outbound network is blocked or the site resets connections. "
+                "Check network from container (curl) and/or site blocking. Full error: " + str(e)
+            )
+
         chrome_bin = find_chrome_binary()
         chromedriver_bin = find_chromedriver_binary()
         logs.append(f"Detected chrome binary: {chrome_bin or '<none>'}")
@@ -198,6 +180,7 @@ def selenium_boost_worker(email: str, password: str, num_buttons: int, headless:
             raise Exception("Chromedriver binary not found. Set CHROMEDRIVER_PATH or install chromium-driver in the image.")
 
         options = webdriver.ChromeOptions()
+        # helpful arguments for headless / container environments
         if headless:
             options.add_argument("--headless=new")
         options.add_argument("--no-sandbox")
@@ -205,18 +188,50 @@ def selenium_boost_worker(email: str, password: str, num_buttons: int, headless:
         options.add_argument("--disable-gpu")
         options.add_argument("--window-size=1920,1080")
         options.add_argument("--lang=en-US")
-        # set binary location if detected (helps selenium find correct browser)
+        options.add_argument("--disable-extensions")
+        options.add_argument("--disable-background-networking")
+        options.add_argument("--disable-sync")
+        options.add_argument("--metrics-recording-only")
+        options.add_argument("--disable-default-apps")
+        options.add_argument("--ignore-certificate-errors")
+        options.add_argument("--remote-debugging-port=0")
+        # reduce some viz-related crashes in some Linux setups
+        options.add_argument("--disable-features=VizDisplayCompositor")
+        # set a realistic user agent (optional tweak)
+        options.add_argument("user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36")
+
+        # try to lower bot-detection fingerprinting
+        options.add_experimental_option("excludeSwitches", ["enable-automation"])
+        options.add_experimental_option("useAutomationExtension", False)
         if chrome_bin:
             options.binary_location = chrome_bin
 
-        # instantiate driver using discovered chromedriver
         service = ChromeService(executable_path=chromedriver_bin)
         driver = webdriver.Chrome(service=service, options=options)
+        # small CDP tweak to hide webdriver flag in window.navigator
+        try:
+            driver.execute_cdp_cmd(
+                "Page.addScriptToEvaluateOnNewDocument",
+                {"source": "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"},
+            )
+        except Exception:
+            # non-fatal
+            pass
+
         wait = WebDriverWait(driver, wait_time)
 
-        # --- LOGIN FLOW ---
-        driver.get("https://www.affordablehousing.com/")
-        logs.append("Opened affordablehousing.com")
+        # robust get with retries/backoff — some sites reset early
+        tries = 3
+        for attempt in range(1, tries + 1):
+            try:
+                driver.get("https://www.affordablehousing.com/")
+                logs.append("Opened affordablehousing.com (via driver.get)")
+                break
+            except Exception as e:
+                logs.append(f"driver.get attempt {attempt} failed: {e}")
+                if attempt == tries:
+                    raise
+                time.sleep(1.5 * attempt)
 
         # click homepage sign-in
         wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "li.ah--signin--link"))).click()
@@ -238,16 +253,14 @@ def selenium_boost_worker(email: str, password: str, num_buttons: int, headless:
         wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "button#signin-with-password-button"))).click()
         logs.append("Clicked final Sign In button")
 
-        # wait for redirect (dashboard)
         wait.until(EC.url_contains("dashboard"))
         logs.append("Login confirmed (dashboard)")
 
-        # --- NAVIGATE TO LISTING PAGE ---
         listing_url = "https://www.affordablehousing.com/v4/pages/Listing/Listing.aspx"
         driver.get(listing_url)
         logs.append(f"Navigated to {listing_url}")
 
-        # incremental scrolling to load dynamic content
+        # incremental scroll to load content
         loops = 0
         last_height = driver.execute_script("return document.body.scrollHeight")
         while loops < DEFAULT_MAX_SCROLL_LOOPS:
@@ -261,21 +274,17 @@ def selenium_boost_worker(email: str, password: str, num_buttons: int, headless:
             last_height = new_height
         logs.append(f"Finished incremental scrolling ({loops} loops)")
 
-        # JS polling for presence of cards/buttons
+        # JS polling
         start = time.time()
-        found_context = None
         found_count = 0
+        found_context = None
         while time.time() - start < DEFAULT_JS_POLL_TIMEOUT:
             c_buttons = int(driver.execute_script(
                 "return document.querySelectorAll('button.usage-boost-button, button.cmn--btn.usage-boost-button').length || 0;"))
-            c_cards = int(driver.execute_script(
-                "return document.querySelectorAll('div.listing--card, div.listing--property--wrapper, div.listing--item').length || 0;"))
-            c_addresses = int(driver.execute_script(
-                "return document.querySelectorAll('div.listing--property--address, div.listing--property--address span').length || 0;"))
-            logs.append(f"[JS POLL] buttons={c_buttons}, cards={c_cards}, addresses={c_addresses}")
-            if c_buttons > 0 or c_cards > 0 or c_addresses > 0:
+            logs.append(f"[JS POLL] buttons={c_buttons}")
+            if c_buttons > 0:
                 found_context = ("main", None)
-                found_count = max(c_buttons, c_cards, c_addresses)
+                found_count = c_buttons
                 break
             time.sleep(DEFAULT_JS_POLL_INTERVAL)
 
@@ -283,16 +292,14 @@ def selenium_boost_worker(email: str, password: str, num_buttons: int, headless:
         if not found_context:
             try:
                 screenshot_b64 = driver.get_screenshot_as_base64()
-                logs.append("No cards/buttons found - saved screenshot (base64)")
+                logs.append("No cards/buttons found - saved screenshot")
             except Exception:
-                logs.append("No cards/buttons found - screenshot failed")
-            raise Exception("No listing cards or buttons found after JS polling")
+                logs.append("Screenshot failed")
+            raise Exception("No listing cards/buttons found after JS polling")
 
-        # collect buttons
         buttons = driver.find_elements(By.CSS_SELECTOR, "button.usage-boost-button, button.cmn--btn.usage-boost-button")
-        logs.append(f"Collected {len(buttons)} button elements in main document (selenium)")
+        logs.append(f"Collected {len(buttons)} button elements")
 
-        # filter boostable: contains 'boost' and not in-progress
         boostable = []
         for idx, btn in enumerate(buttons, start=1):
             try:
@@ -305,21 +312,19 @@ def selenium_boost_worker(email: str, password: str, num_buttons: int, headless:
                     boostable.append((address, btn, norm))
                     logs.append(f"[FOUND] btn#{idx} text='{norm}' addr='{address or '<none>'}'")
                 else:
-                    logs.append(f"[SKIP] btn#{idx} text='{norm[:60]}' class='{classes[:80]}' in_progress={in_progress}")
+                    logs.append(f"[SKIP] btn#{idx} text='{norm[:60]}' in_progress={in_progress}")
             except Exception as e:
                 logs.append(f"[WARN] error inspecting btn#{idx}: {e}")
-                continue
 
         logs.append(f"Total boostable detected: {len(boostable)}")
         if not boostable:
             try:
                 screenshot_b64 = driver.get_screenshot_as_base64()
-                logs.append("No boostable buttons after filtering - saved screenshot (base64)")
+                logs.append("No boostable buttons after filtering - saved screenshot")
             except Exception:
-                logs.append("No boostable buttons - screenshot failed")
+                logs.append("screenshot failed")
             raise Exception("No boostable buttons found to click")
 
-        # click up to requested number
         to_click = min(num_buttons, len(boostable))
         clicked = 0
         for i in range(to_click):
@@ -330,11 +335,10 @@ def selenium_boost_worker(email: str, password: str, num_buttons: int, headless:
                 driver.execute_script("arguments[0].click();", btn)
                 clicked += 1
                 clicked_addresses.append(address)
-                logs.append(f"Clicked boost for: {address or '<address not found>'} (text='{text}')")
-                time.sleep(1.5)
+                logs.append(f"Clicked boost for: {address or '<address not found>'}")
+                time.sleep(1.2)
             except Exception as ce:
-                logs.append(f"Error clicking boost #{i+1} ({address or 'unknown'}): {ce}")
-                continue
+                logs.append(f"Error clicking boost #{i+1}: {ce}")
 
         return BoostResponse(
             success=True,
@@ -364,6 +368,7 @@ def selenium_boost_worker(email: str, password: str, num_buttons: int, headless:
             error=str(exc),
             screenshot_base64=screenshot_b64
         )
+
     finally:
         try:
             if driver:
@@ -373,8 +378,7 @@ def selenium_boost_worker(email: str, password: str, num_buttons: int, headless:
             pass
 
 
-# ---- FastAPI endpoints ----
-
+# ---- endpoints ----
 @app.get("/")
 def health():
     return {"status": "Boost API running"}
@@ -382,7 +386,6 @@ def health():
 
 @app.get("/browser")
 def browser_test():
-    """Simple endpoint to test chrome/chromedriver availability and return Google title."""
     logs = []
     chrome_bin = find_chrome_binary()
     chromedriver_bin = find_chromedriver_binary()
@@ -392,13 +395,21 @@ def browser_test():
     if not chromedriver_bin:
         raise HTTPException(status_code=500, detail={"error": "chromedriver not found", "logs": logs})
 
+    # Quick remote pre-check
+    try:
+        requests.head("https://www.google.com", timeout=6)
+        logs.append("google HEAD ok")
+    except Exception as e:
+        logs.append(f"connectivity test failed: {e}")
+        raise HTTPException(status_code=500, detail={"error": "connectivity test failed", "logs": logs})
+
     options = webdriver.ChromeOptions()
     options.add_argument("--headless=new")
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     if chrome_bin:
         options.binary_location = chrome_bin
-
+    options.add_argument("--ignore-certificate-errors")
     service = ChromeService(executable_path=chromedriver_bin)
     driver = webdriver.Chrome(service=service, options=options)
     try:
@@ -411,7 +422,6 @@ def browser_test():
 
 @app.post("/boost", response_model=BoostResponse)
 async def boost_endpoint(req: BoostRequest):
-    # run Selenium in a background thread to avoid blocking event loop
     loop = asyncio.get_event_loop()
     try:
         result: BoostResponse = await loop.run_in_executor(
@@ -425,5 +435,4 @@ async def boost_endpoint(req: BoostRequest):
         )
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Server error: {exc}")
-
     return result

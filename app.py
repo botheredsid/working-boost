@@ -1,4 +1,4 @@
-# app.py
+# app.py (updated)
 import asyncio
 import base64
 import time
@@ -7,7 +7,7 @@ import os
 import shutil
 from typing import List, Optional
 
-from urllib.request import Request, urlopen
+from urllib.request import Request, urlopen, ProxyHandler, build_opener, install_opener
 from urllib.error import URLError, HTTPError
 
 from fastapi import FastAPI, HTTPException
@@ -149,6 +149,59 @@ def find_address_for_button(drv, btn):
     return None
 
 
+# ---------- network pre-check helper ----------
+def network_precheck(test_url: str, timeout: int, logs: List[str]) -> None:
+    """
+    Raises Exception on failure unless SKIP_NETWORK_CHECK is set.
+    Supports HTTPS_PROXY / HTTP_PROXY environment variables.
+    """
+    skip_check = os.environ.get("SKIP_NETWORK_CHECK", "").lower() in ("1", "true", "yes")
+    proxy_env = os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY")
+
+    if skip_check:
+        logs.append("SKIP_NETWORK_CHECK=true -> skipping network pre-check")
+        return
+
+    logs.append(f"Connectivity quick-check to {test_url}")
+    opener = None
+    try:
+        if proxy_env:
+            # ProxyHandler expects e.g. {'http': 'http://host:port', 'https': 'http://host:port'}
+            logs.append(f"Using proxy for pre-check: {proxy_env}")
+            ph = ProxyHandler({"http": proxy_env, "https": proxy_env})
+            opener = build_opener(ph)
+            install_opener(opener)
+
+        # Try HEAD first because it's lighter; fall back to GET if HEAD fails
+        req = Request(test_url, method="HEAD")
+        try:
+            with urlopen(req, timeout=timeout) as resp:
+                status = getattr(resp, "status", None)
+                logs.append(f"HEAD status_code={status}")
+                return
+        except HTTPError as he:
+            # Some servers block HEAD - try GET fallback
+            logs.append(f"HEAD failed with HTTPError {he.code}, trying GET fallback")
+        except URLError as ue:
+            logs.append(f"HEAD URLError: {ue}")
+        except Exception as e:
+            logs.append(f"HEAD exception: {e}")
+
+        # GET fallback
+        try:
+            req2 = Request(test_url, method="GET")
+            with urlopen(req2, timeout=timeout) as resp:
+                status = getattr(resp, "status", None)
+                logs.append(f"GET status_code={status}")
+                return
+        except Exception as e:
+            # Bubble up a more descriptive error
+            raise Exception(f"Network pre-check failed: {e}")
+    finally:
+        # ensure we don't leave any custom opener globally if none was set earlier
+        pass
+
+
 # ---------- selenium worker ----------
 def selenium_boost_worker(email: str, password: str, num_buttons: int, headless: bool,
                           wait_time: int = DEFAULT_WAIT_TIME) -> BoostResponse:
@@ -159,20 +212,18 @@ def selenium_boost_worker(email: str, password: str, num_buttons: int, headless:
     try:
         logs.append("Starting Selenium worker")
 
-        # quick network pre-check (no external dependency)
+        # do network pre-check unless skipped
         test_url = "https://www.affordablehousing.com/"
-        logs.append(f"Connectivity quick-check to {test_url}")
         try:
-            req = Request(test_url, method="HEAD")
-            with urlopen(req, timeout=6) as resp:
-                status = getattr(resp, "status", None)
-                logs.append(f"HEAD status_code={status}")
+            network_precheck(test_url, timeout=6, logs=logs)
         except Exception as e:
             logs.append(f"Pre-check failed: {e}")
-            raise Exception(
-                f"Network pre-check failed for {test_url}. Either outbound network is blocked or the site resets connections. "
-                "Check network from container (curl) and/or site blocking. Full error: " + str(e)
-            )
+            # re-raise to return a helpful response (unless SKIP_NETWORK_CHECK true)
+            if os.environ.get("SKIP_NETWORK_CHECK", "").lower() not in ("1", "true", "yes"):
+                raise Exception(
+                    f"Network pre-check failed for {test_url}. Either outbound network is blocked or the site resets connections. Full error: {e}"
+                )
+            # else continue (skip pre-check)
 
         chrome_bin = find_chrome_binary()
         chromedriver_bin = find_chromedriver_binary()
@@ -180,8 +231,9 @@ def selenium_boost_worker(email: str, password: str, num_buttons: int, headless:
         logs.append(f"Detected chromedriver binary: {chromedriver_bin or '<none>'}")
 
         if not chromedriver_bin:
-            raise Exception("Chromedriver binary not found. Set CHROMEDRIVER_PATH or install chromium-driver in the image.")
+            raise Exception("Chromedriver binary not found. Set CHROMEDRIVER_PATH or install chromedriver in the image.")
 
+        # build Chrome options
         options = webdriver.ChromeOptions()
         if headless:
             options.add_argument("--headless=new")
@@ -202,12 +254,21 @@ def selenium_boost_worker(email: str, password: str, num_buttons: int, headless:
 
         options.add_experimental_option("excludeSwitches", ["enable-automation"])
         options.add_experimental_option("useAutomationExtension", False)
+
         if chrome_bin:
             options.binary_location = chrome_bin
 
+        # if proxy env set, pass it to Chrome
+        proxy_env = os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY")
+        if proxy_env:
+            logs.append(f"Setting Chrome proxy: {proxy_env}")
+            options.add_argument(f"--proxy-server={proxy_env}")
+
+        # instantiate driver
         service = ChromeService(executable_path=chromedriver_bin)
         driver = webdriver.Chrome(service=service, options=options)
         try:
+            # small stealth: override navigator.webdriver
             driver.execute_cdp_cmd(
                 "Page.addScriptToEvaluateOnNewDocument",
                 {"source": "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"},
@@ -215,9 +276,9 @@ def selenium_boost_worker(email: str, password: str, num_buttons: int, headless:
         except Exception:
             pass
 
-        wait = WebDriverWait(driver, wait_time)
+        wait = WebDriverWait(driver, wait_time or DEFAULT_WAIT_TIME)
 
-        # robust get with retries/backoff
+        # robust GET with retries/backoff
         tries = 3
         for attempt in range(1, tries + 1):
             try:
@@ -389,8 +450,15 @@ def browser_test():
     if not chromedriver_bin:
         raise HTTPException(status_code=500, detail={"error": "chromedriver not found", "logs": logs})
 
-    # Quick remote pre-check using standard library
+    # Quick remote pre-check using standard library (respect proxy env)
     try:
+        proxy_env = os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY")
+        if proxy_env:
+            ph = ProxyHandler({"http": proxy_env, "https": proxy_env})
+            opener = build_opener(ph)
+            install_opener(opener)
+            logs.append(f"Using proxy for browser_test: {proxy_env}")
+
         req = Request("https://www.google.com", method="HEAD")
         with urlopen(req, timeout=6) as r:
             logs.append(f"google HEAD ok status={getattr(r,'status',None)}")
@@ -405,6 +473,11 @@ def browser_test():
     if chrome_bin:
         options.binary_location = chrome_bin
     options.add_argument("--ignore-certificate-errors")
+
+    proxy_env = os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY")
+    if proxy_env:
+        options.add_argument(f"--proxy-server={proxy_env}")
+
     service = ChromeService(executable_path=chromedriver_bin)
     driver = webdriver.Chrome(service=service, options=options)
     try:

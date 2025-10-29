@@ -19,7 +19,6 @@ DEFAULT_SCROLL_PAUSE = 1.0
 DEFAULT_MAX_SCROLL_LOOPS = 60
 DEFAULT_JS_POLL_INTERVAL = 1.0
 DEFAULT_JS_POLL_TIMEOUT = 45
-DEFAULT_PER_LISTING_WAIT = 3
 # ---------------------------------
 
 app = FastAPI(title="AffordableHousing Boost API", version="1.0")
@@ -41,11 +40,12 @@ class BoostResponse(BaseModel):
     error: Optional[str] = None
     screenshot_base64: Optional[str] = None
 
+
 @app.get("/")
 def root():
     return {"status": "Boost API running"}
 
-# ---- Helper functions ----
+
 def get_element_text_via_js(drv, el):
     try:
         txt = drv.execute_script(
@@ -58,15 +58,36 @@ def get_element_text_via_js(drv, el):
 
 def find_address_for_button(drv, btn):
     try:
-        anc = btn.find_element(By.XPATH, "./ancestor::div[contains(@class,'listing--card')][1]")
-        addr_el = anc.find_element(By.CSS_SELECTOR, "div.listing--property--address span, div.listing--property--address")
-        return get_element_text_via_js(drv, addr_el)
+        for xp in [
+            "./ancestor::div[contains(@class,'listing--card')][1]",
+            "./ancestor::div[contains(@class,'listing--item')][1]",
+            "./ancestor::div[contains(@class,'listing--property--wrapper')][1]"
+        ]:
+            try:
+                anc = btn.find_element(By.XPATH, xp)
+                addr_el = anc.find_element(By.CSS_SELECTOR,
+                                             "div.listing--property--address span, div.listing--property--address")
+                addr = get_element_text_via_js(drv, addr_el)
+                if addr:
+                    return addr
+            except Exception:
+                continue
+        # fallback: preceding
+        try:
+            addr_el = btn.find_element(By.XPATH,
+                                       "preceding::div[contains(@class,'listing--property--address')][1]//span")
+            addr = get_element_text_via_js(drv, addr_el)
+            if addr:
+                return addr
+        except Exception:
+            pass
     except Exception:
-        return None
+        pass
+    return None
 
 
-# ---- Main Selenium Worker ----
-def selenium_boost_worker(email: str, password: str, num_buttons: int, headless: bool, wait_time: int = DEFAULT_WAIT_TIME) -> BoostResponse:
+def selenium_boost_worker(email: str, password: str, num_buttons: int, headless: bool,
+                          wait_time: int = DEFAULT_WAIT_TIME) -> BoostResponse:
     logs: List[str] = []
     clicked_addresses: List[Optional[str]] = []
     screenshot_b64 = None
@@ -75,7 +96,6 @@ def selenium_boost_worker(email: str, password: str, num_buttons: int, headless:
     try:
         logs.append("Starting Selenium worker")
 
-        # Use Chrome path suitable for Render/Docker
         chrome_path = os.environ.get("CHROME_BIN", "/usr/bin/chromium")
         chromedriver_path = os.environ.get("CHROMEDRIVER_PATH", "/usr/bin/chromedriver")
 
@@ -87,6 +107,8 @@ def selenium_boost_worker(email: str, password: str, num_buttons: int, headless:
         options.add_argument("--disable-dev-shm-usage")
         options.add_argument("--window-size=1920,1080")
         options.add_argument("--lang=en-US")
+        # optionally set binary if needed:
+        options.binary_location = chrome_path
 
         service = ChromeService(executable_path=chromedriver_path)
         driver = webdriver.Chrome(service=service, options=options)
@@ -100,6 +122,7 @@ def selenium_boost_worker(email: str, password: str, num_buttons: int, headless:
         logs.append("Clicked homepage Sign In")
 
         email_input = wait.until(EC.visibility_of_element_located((By.CSS_SELECTOR, "input#ah_user")))
+        email_input.clear()
         email_input.send_keys(email)
         logs.append("Entered email")
 
@@ -107,6 +130,7 @@ def selenium_boost_worker(email: str, password: str, num_buttons: int, headless:
         logs.append("Clicked first Sign In button")
 
         password_input = wait.until(EC.visibility_of_element_located((By.CSS_SELECTOR, "input#ah_pass")))
+        password_input.clear()
         password_input.send_keys(password)
         logs.append("Entered password")
 
@@ -116,20 +140,56 @@ def selenium_boost_worker(email: str, password: str, num_buttons: int, headless:
         wait.until(EC.url_contains("dashboard"))
         logs.append("Login confirmed (dashboard)")
 
-        # Go to listing page
-        driver.get("https://www.affordablehousing.com/v4/pages/Listing/Listing.aspx")
-        logs.append("Navigated to listings")
+        # --- Navigate to listing page ---
+        listing_url = "https://www.affordablehousing.com/v4/pages/Listing/Listing.aspx"
+        driver.get(listing_url)
+        logs.append(f"Navigated to listing page: {listing_url}")
 
-        # Example: Wait for boost buttons
-        buttons = wait.until(EC.presence_of_all_elements_located((By.CSS_SELECTOR, "button.usage-boost-button")))
-        logs.append(f"Found {len(buttons)} boost buttons")
+        # --- Scroll to trigger lazy load ---
+        last_height = driver.execute_script("return document.body.scrollHeight")
+        loops = 0
+        while loops < DEFAULT_MAX_SCROLL_LOOPS:
+            driver.execute_script("window.scrollBy(0, window.innerHeight);")
+            time.sleep(DEFAULT_SCROLL_PAUSE)
+            loops += 1
+            new_height = driver.execute_script("return document.body.scrollHeight")
+            if new_height == last_height:
+                break
+            last_height = new_height
+        logs.append(f"Completed scrolling: {loops} loops")
+
+        # --- JS polling for buttons/cards ---
+        start = time.time()
+        found_context = None
+        found_count = 0
+        while time.time() - start < DEFAULT_JS_POLL_TIMEOUT:
+            c_buttons = int(driver.execute_script(
+                "return document.querySelectorAll('button.usage-boost-button, button.cmn--btn.usage-boost-button').length || 0;"))
+            logs.append(f"[JS POLL] found buttons={c_buttons}")
+            if c_buttons > 0:
+                found_context = ("main", None)
+                found_count = c_buttons
+                break
+            time.sleep(DEFAULT_JS_POLL_INTERVAL)
+
+        logs.append(f"[JS POLL RESULT] found_context={found_context}, found_count={found_count}")
+        if not found_context:
+            logs.append("No boost buttons found after polling.")
+            screenshot_b64 = driver.get_screenshot_as_base64()
+            logs.append("Screenshot captured for debugging.")
+            raise Exception("No boost buttons found to click")
+
+        # --- Collect button elements ---
+        buttons = driver.find_elements(
+            By.CSS_SELECTOR, "button.usage-boost-button, button.cmn--btn.usage-boost-button")
+        logs.append(f"Found {len(buttons)} button WebElements")
 
         clicked = 0
         for i, btn in enumerate(buttons[:num_buttons]):
             try:
                 driver.execute_script("arguments[0].scrollIntoView({block:'center'});", btn)
                 time.sleep(0.6)
-                driver.execute_script("arguments[0].click();", btn)
+                btn.click()
                 addr = find_address_for_button(driver, btn)
                 clicked_addresses.append(addr)
                 clicked += 1
@@ -138,7 +198,14 @@ def selenium_boost_worker(email: str, password: str, num_buttons: int, headless:
             except Exception as ce:
                 logs.append(f"Click error #{i+1}: {ce}")
 
-        return BoostResponse(success=True, clicked_count=clicked, clicked_addresses=clicked_addresses, debug_logs=logs)
+        return BoostResponse(
+            success=True,
+            clicked_count=clicked,
+            clicked_addresses=clicked_addresses,
+            debug_logs=logs,
+            error=None,
+            screenshot_base64=screenshot_b64
+        )
 
     except Exception as e:
         logs.append(f"Error: {str(e)}")
@@ -146,9 +213,17 @@ def selenium_boost_worker(email: str, password: str, num_buttons: int, headless:
         if driver:
             try:
                 screenshot_b64 = driver.get_screenshot_as_base64()
+                logs.append("Captured screenshot for error.")
             except Exception:
                 pass
-        return BoostResponse(success=False, clicked_count=0, clicked_addresses=[], debug_logs=logs, error=str(e), screenshot_base64=screenshot_b64)
+        return BoostResponse(
+            success=False,
+            clicked_count=0,
+            clicked_addresses=[],
+            debug_logs=logs,
+            error=str(e),
+            screenshot_base64=screenshot_base64
+        )
 
     finally:
         if driver:
@@ -167,7 +242,7 @@ async def boost_endpoint(req: BoostRequest):
             req.password,
             req.num_buttons,
             req.headless,
-            req.wait_time or DEFAULT_WAIT_TIME,
+            req.wait_time or DEFAULT_WAIT_TIME
         )
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Server error: {exc}")

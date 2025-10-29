@@ -7,7 +7,9 @@ import os
 import shutil
 from typing import List, Optional
 
-import requests
+from urllib.request import Request, urlopen
+from urllib.error import URLError, HTTPError
+
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
@@ -157,13 +159,14 @@ def selenium_boost_worker(email: str, password: str, num_buttons: int, headless:
     try:
         logs.append("Starting Selenium worker")
 
-        # quick network pre-check (faster feedback than launching full browser)
+        # quick network pre-check (no external dependency)
         test_url = "https://www.affordablehousing.com/"
         logs.append(f"Connectivity quick-check to {test_url}")
         try:
-            # small timeout so this returns fast if blocked
-            r = requests.head(test_url, timeout=6, allow_redirects=True)
-            logs.append(f"HEAD status_code={r.status_code}")
+            req = Request(test_url, method="HEAD")
+            with urlopen(req, timeout=6) as resp:
+                status = getattr(resp, "status", None)
+                logs.append(f"HEAD status_code={status}")
         except Exception as e:
             logs.append(f"Pre-check failed: {e}")
             raise Exception(
@@ -180,7 +183,6 @@ def selenium_boost_worker(email: str, password: str, num_buttons: int, headless:
             raise Exception("Chromedriver binary not found. Set CHROMEDRIVER_PATH or install chromium-driver in the image.")
 
         options = webdriver.ChromeOptions()
-        # helpful arguments for headless / container environments
         if headless:
             options.add_argument("--headless=new")
         options.add_argument("--no-sandbox")
@@ -195,12 +197,9 @@ def selenium_boost_worker(email: str, password: str, num_buttons: int, headless:
         options.add_argument("--disable-default-apps")
         options.add_argument("--ignore-certificate-errors")
         options.add_argument("--remote-debugging-port=0")
-        # reduce some viz-related crashes in some Linux setups
         options.add_argument("--disable-features=VizDisplayCompositor")
-        # set a realistic user agent (optional tweak)
         options.add_argument("user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36")
 
-        # try to lower bot-detection fingerprinting
         options.add_experimental_option("excludeSwitches", ["enable-automation"])
         options.add_experimental_option("useAutomationExtension", False)
         if chrome_bin:
@@ -208,19 +207,17 @@ def selenium_boost_worker(email: str, password: str, num_buttons: int, headless:
 
         service = ChromeService(executable_path=chromedriver_bin)
         driver = webdriver.Chrome(service=service, options=options)
-        # small CDP tweak to hide webdriver flag in window.navigator
         try:
             driver.execute_cdp_cmd(
                 "Page.addScriptToEvaluateOnNewDocument",
                 {"source": "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"},
             )
         except Exception:
-            # non-fatal
             pass
 
         wait = WebDriverWait(driver, wait_time)
 
-        # robust get with retries/backoff — some sites reset early
+        # robust get with retries/backoff
         tries = 3
         for attempt in range(1, tries + 1):
             try:
@@ -233,7 +230,6 @@ def selenium_boost_worker(email: str, password: str, num_buttons: int, headless:
                     raise
                 time.sleep(1.5 * attempt)
 
-        # click homepage sign-in
         wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "li.ah--signin--link"))).click()
         logs.append("Clicked homepage Sign In")
 
@@ -260,7 +256,6 @@ def selenium_boost_worker(email: str, password: str, num_buttons: int, headless:
         driver.get(listing_url)
         logs.append(f"Navigated to {listing_url}")
 
-        # incremental scroll to load content
         loops = 0
         last_height = driver.execute_script("return document.body.scrollHeight")
         while loops < DEFAULT_MAX_SCROLL_LOOPS:
@@ -274,7 +269,6 @@ def selenium_boost_worker(email: str, password: str, num_buttons: int, headless:
             last_height = new_height
         logs.append(f"Finished incremental scrolling ({loops} loops)")
 
-        # JS polling
         start = time.time()
         found_count = 0
         found_context = None
@@ -395,10 +389,11 @@ def browser_test():
     if not chromedriver_bin:
         raise HTTPException(status_code=500, detail={"error": "chromedriver not found", "logs": logs})
 
-    # Quick remote pre-check
+    # Quick remote pre-check using standard library
     try:
-        requests.head("https://www.google.com", timeout=6)
-        logs.append("google HEAD ok")
+        req = Request("https://www.google.com", method="HEAD")
+        with urlopen(req, timeout=6) as r:
+            logs.append(f"google HEAD ok status={getattr(r,'status',None)}")
     except Exception as e:
         logs.append(f"connectivity test failed: {e}")
         raise HTTPException(status_code=500, detail={"error": "connectivity test failed", "logs": logs})

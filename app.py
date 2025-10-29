@@ -41,6 +41,9 @@ class BoostResponse(BaseModel):
     error: Optional[str] = None
     screenshot_base64: Optional[str] = None
 
+@app.get("/")
+def root():
+    return {"status": "Boost API running"}
 
 # ---- Helper functions ----
 def get_element_text_via_js(drv, el):
